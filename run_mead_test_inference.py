@@ -7,6 +7,7 @@ import argparse
 import ast
 import copy
 import json
+import shutil
 from pathlib import Path
 
 import torch
@@ -134,10 +135,66 @@ def patch_qwen_tokenizer_file(tokenizer_path: str) -> None:
             file_path.write_text(text, encoding="utf-8")
 
 
+def ensure_base_model_support_files(base_model_path: str) -> None:
+    base_path = Path(base_model_path)
+    repo_root = Path(__file__).resolve().parent
+    required = [
+        "qwen_generation_utils.py",
+        "configuration_qwen.py",
+        "audio.py",
+        "cpp_kernels.py",
+    ]
+    for name in required:
+        dst = base_path / name
+        src = repo_root / name
+        if not dst.exists() and src.exists():
+            shutil.copy(src, dst)
+
+
 def resolve_torch_dtype(device_map: str):
     if device_map == "cpu":
         return torch.float32
     return torch.float16
+
+
+def resolve_inner_model(model):
+    if hasattr(model, "get_base_model"):
+        try:
+            return model.get_base_model()
+        except Exception:
+            pass
+    inner = getattr(model, "base_model", None)
+    if inner is not None and hasattr(inner, "model"):
+        return inner.model
+    return model
+
+
+def apply_qwen_length_overrides(model, max_new_tokens: int) -> None:
+    target_max_length = max(max_new_tokens + 8192, 16384)
+    models = [model]
+    inner_model = resolve_inner_model(model)
+    if inner_model is not model:
+        models.append(inner_model)
+
+    for item in models:
+        if getattr(item, "generation_config", None) is not None:
+            item.generation_config.max_length = max(
+                getattr(item.generation_config, "max_length", 0) or 0,
+                target_max_length,
+            )
+            item.generation_config.max_new_tokens = max_new_tokens
+        config = getattr(item, "config", None)
+        if config is not None:
+            if hasattr(config, "max_position_embeddings"):
+                config.max_position_embeddings = max(
+                    getattr(config, "max_position_embeddings", 0) or 0,
+                    target_max_length,
+                )
+            if hasattr(config, "seq_length"):
+                config.seq_length = max(
+                    getattr(config, "seq_length", 0) or 0,
+                    target_max_length,
+                )
 
 
 def parse_response(response: str) -> tuple[str | None, list | None, str | None]:
@@ -166,6 +223,7 @@ def main() -> int:
     tokenizer_path = resolve_tokenizer_path(
         args.base_model_path, args.lora_model_path
     )
+    ensure_base_model_support_files(args.base_model_path)
     patch_qwen_tokenizer_file(tokenizer_path)
     print(f"tokenizer_path={tokenizer_path}")
     tokenizer = AutoTokenizer.from_pretrained(
@@ -180,7 +238,7 @@ def main() -> int:
         trust_remote_code=True,
     ).eval()
     model = PeftModel.from_pretrained(model, args.lora_model_path)
-    model.generation_config.max_length = 16384
+    apply_qwen_length_overrides(model, args.max_new_tokens)
     generation_config = build_generation_config(
         model, max_new_tokens=args.max_new_tokens, do_sample=args.do_sample
     )

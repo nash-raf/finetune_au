@@ -154,6 +154,46 @@ def resolve_torch_dtype(device_map: str):
     return torch.float16
 
 
+def resolve_inner_model(model):
+    if hasattr(model, "get_base_model"):
+        try:
+            return model.get_base_model()
+        except Exception:
+            pass
+    inner = getattr(model, "base_model", None)
+    if inner is not None and hasattr(inner, "model"):
+        return inner.model
+    return model
+
+
+def apply_qwen_length_overrides(model, max_new_tokens: int) -> None:
+    target_max_length = max(max_new_tokens + 8192, 16384)
+    models = [model]
+    inner_model = resolve_inner_model(model)
+    if inner_model is not model:
+        models.append(inner_model)
+
+    for item in models:
+        if getattr(item, "generation_config", None) is not None:
+            item.generation_config.max_length = max(
+                getattr(item.generation_config, "max_length", 0) or 0,
+                target_max_length,
+            )
+            item.generation_config.max_new_tokens = max_new_tokens
+        config = getattr(item, "config", None)
+        if config is not None:
+            if hasattr(config, "max_position_embeddings"):
+                config.max_position_embeddings = max(
+                    getattr(config, "max_position_embeddings", 0) or 0,
+                    target_max_length,
+                )
+            if hasattr(config, "seq_length"):
+                config.seq_length = max(
+                    getattr(config, "seq_length", 0) or 0,
+                    target_max_length,
+                )
+
+
 def sync_if_needed() -> None:
     if torch.cuda.is_available():
         torch.cuda.synchronize()
@@ -167,23 +207,39 @@ def instrument_inference(model, tokenizer, enabled: bool):
         "process_audio_seconds": 0.0,
         "make_context_seconds": 0.0,
         "audio_encode_seconds": 0.0,
+        "chat_seconds": 0.0,
         "generate_seconds": 0.0,
         "forward_seconds": 0.0,
+        "transformer_forward_seconds": 0.0,
+        "block_seconds": 0.0,
+        "attention_seconds": 0.0,
+        "mlp_seconds": 0.0,
     }
     counts = {
         "process_audio_calls": 0,
         "make_context_calls": 0,
         "audio_encode_calls": 0,
+        "chat_calls": 0,
         "generate_calls": 0,
         "forward_calls": 0,
+        "transformer_forward_calls": 0,
+        "block_calls": 0,
+        "attention_calls": 0,
+        "mlp_calls": 0,
     }
 
-    model_module = sys.modules[model.__class__.__module__]
+    inner_model = resolve_inner_model(model)
+    model_module = sys.modules[inner_model.__class__.__module__]
     orig_make_context = getattr(model_module, "make_context", None)
     orig_process_audio = getattr(tokenizer, "process_audio", None)
-    orig_audio_encode = getattr(model.transformer.audio, "encode", None)
-    orig_generate = model.generate
-    orig_forward = model.forward
+    orig_audio_encode = getattr(inner_model.transformer.audio, "encode", None)
+    orig_chat = inner_model.chat
+    orig_generate = inner_model.generate
+    orig_forward = inner_model.forward
+    orig_transformer_forward = inner_model.transformer.forward
+    orig_block_forwards = [block.forward for block in inner_model.transformer.h]
+    orig_attention_forwards = [block.attn.forward for block in inner_model.transformer.h]
+    orig_mlp_forwards = [block.mlp.forward for block in inner_model.transformer.h]
 
     def timed_call(key_seconds, key_calls, fn, *args, **kwargs):
         sync_if_needed()
@@ -233,6 +289,16 @@ def instrument_inference(model, tokenizer, enabled: bool):
 
         model.transformer.audio.encode = wrapped_audio_encode
 
+    @functools.wraps(orig_chat)
+    def wrapped_chat(*args, **kwargs):
+        return timed_call(
+            "chat_seconds",
+            "chat_calls",
+            orig_chat,
+            *args,
+            **kwargs,
+        )
+
     @functools.wraps(orig_generate)
     def wrapped_generate(*args, **kwargs):
         return timed_call(
@@ -253,8 +319,61 @@ def instrument_inference(model, tokenizer, enabled: bool):
             **kwargs,
         )
 
+    @functools.wraps(orig_transformer_forward)
+    def wrapped_transformer_forward(*args, **kwargs):
+        return timed_call(
+            "transformer_forward_seconds",
+            "transformer_forward_calls",
+            orig_transformer_forward,
+            *args,
+            **kwargs,
+        )
+
     model.generate = wrapped_generate
     model.forward = wrapped_forward
+    inner_model.chat = wrapped_chat
+    inner_model.generate = wrapped_generate
+    inner_model.forward = wrapped_forward
+    inner_model.transformer.forward = wrapped_transformer_forward
+
+    for block, orig_block_forward in zip(inner_model.transformer.h, orig_block_forwards):
+        @functools.wraps(orig_block_forward)
+        def wrapped_block_forward(*args, __orig=orig_block_forward, **kwargs):
+            return timed_call(
+                "block_seconds",
+                "block_calls",
+                __orig,
+                *args,
+                **kwargs,
+            )
+
+        block.forward = wrapped_block_forward
+
+    for block, orig_attention_forward in zip(inner_model.transformer.h, orig_attention_forwards):
+        @functools.wraps(orig_attention_forward)
+        def wrapped_attention_forward(*args, __orig=orig_attention_forward, **kwargs):
+            return timed_call(
+                "attention_seconds",
+                "attention_calls",
+                __orig,
+                *args,
+                **kwargs,
+            )
+
+        block.attn.forward = wrapped_attention_forward
+
+    for block, orig_mlp_forward in zip(inner_model.transformer.h, orig_mlp_forwards):
+        @functools.wraps(orig_mlp_forward)
+        def wrapped_mlp_forward(*args, __orig=orig_mlp_forward, **kwargs):
+            return timed_call(
+                "mlp_seconds",
+                "mlp_calls",
+                __orig,
+                *args,
+                **kwargs,
+            )
+
+        block.mlp.forward = wrapped_mlp_forward
 
     def reset_timings():
         for key in timings:
@@ -287,7 +406,7 @@ def main() -> int:
         trust_remote_code=True,
     ).eval()
     model = PeftModel.from_pretrained(model, args.lora_model_path)
-    model.generation_config.max_length = 16384
+    apply_qwen_length_overrides(model, args.max_new_tokens)
     generation_config = build_generation_config(model, args.max_new_tokens)
     load_elapsed = time.perf_counter() - load_started
     instrumentation, reset_timings = instrument_inference(
@@ -305,6 +424,14 @@ def main() -> int:
 
     print(f"sample_id={record['id']}")
     print(f"model_load_seconds={load_elapsed:.3f}")
+    inner_model = resolve_inner_model(model)
+    print(
+        "generation_limits "
+        f"outer_max_length={getattr(model.generation_config, 'max_length', None)} "
+        f"inner_max_length={getattr(inner_model.generation_config, 'max_length', None)} "
+        f"config_max_position_embeddings={getattr(inner_model.config, 'max_position_embeddings', None)} "
+        f"config_seq_length={getattr(inner_model.config, 'seq_length', None)}"
+    )
 
     for run_idx in range(1, args.warm_runs + 1):
         reset_timings()
@@ -339,6 +466,8 @@ def main() -> int:
             print(
                 f"run_{run_idx}_audio_encode_calls={counts['audio_encode_calls']}"
             )
+            print(f"run_{run_idx}_chat_seconds={timings['chat_seconds']:.3f}")
+            print(f"run_{run_idx}_chat_calls={counts['chat_calls']}")
             print(
                 f"run_{run_idx}_generate_seconds={timings['generate_seconds']:.3f}"
             )
@@ -347,6 +476,22 @@ def main() -> int:
                 f"run_{run_idx}_forward_seconds={timings['forward_seconds']:.3f}"
             )
             print(f"run_{run_idx}_forward_calls={counts['forward_calls']}")
+            print(
+                f"run_{run_idx}_transformer_forward_seconds={timings['transformer_forward_seconds']:.3f}"
+            )
+            print(
+                f"run_{run_idx}_transformer_forward_calls={counts['transformer_forward_calls']}"
+            )
+            print(
+                f"run_{run_idx}_block_seconds={timings['block_seconds']:.3f}"
+            )
+            print(f"run_{run_idx}_block_calls={counts['block_calls']}")
+            print(
+                f"run_{run_idx}_attention_seconds={timings['attention_seconds']:.3f}"
+            )
+            print(f"run_{run_idx}_attention_calls={counts['attention_calls']}")
+            print(f"run_{run_idx}_mlp_seconds={timings['mlp_seconds']:.3f}")
+            print(f"run_{run_idx}_mlp_calls={counts['mlp_calls']}")
             if counts["forward_calls"] > 0:
                 print(
                     "run_{}_avg_forward_seconds={:.6f}".format(
