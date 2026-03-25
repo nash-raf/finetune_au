@@ -85,9 +85,16 @@ flash_attn_unpadded_func = None
 def _import_flash_attn():
     global apply_rotary_emb_func, rms_norm, flash_attn_unpadded_func
     try:
-        from flash_attn.layers.rotary import apply_rotary_emb_func as __apply_rotary_emb_func
-        apply_rotary_emb_func = __apply_rotary_emb_func
-    except ImportError:
+        if hasattr(torch, "library") and hasattr(torch.library, "wrap_triton"):
+            from flash_attn.layers.rotary import apply_rotary_emb_func as __apply_rotary_emb_func
+            apply_rotary_emb_func = __apply_rotary_emb_func
+        else:
+            logger.warn(
+                "Warning: disabling flash_attn rotary because this torch build lacks torch.library.wrap_triton; "
+                "falling back to the default rotary path."
+            )
+            apply_rotary_emb_func = None
+    except Exception:
         logger.warn(
             "Warning: import flash_attn rotary fail, please install FlashAttention rotary to get higher efficiency "
             "https://github.com/Dao-AILab/flash-attention/tree/main/csrc/rotary"
@@ -117,6 +124,15 @@ def _import_flash_attn():
             "Warning: import flash_attn fail, please install FlashAttention to get higher efficiency "
             "https://github.com/Dao-AILab/flash-attention"
         )
+
+    logger.warn(
+        "FlashAttention status: attention=%s rotary=%s rms_norm=%s"
+        % (
+            flash_attn_unpadded_func is not None,
+            apply_rotary_emb_func is not None,
+            rms_norm is not None,
+        )
+    )
 
 def quantize_cache_v(fdata, bits, qmax, qmin):
     # b, s, head, h-dim->b, head, s, h-dim
