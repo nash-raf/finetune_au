@@ -110,6 +110,40 @@ def build_generation_config(model, max_new_tokens: int):
     return generation_config
 
 
+def resolve_tokenizer_path(base_model_path: str, lora_model_path: str) -> str:
+    lora_path = Path(lora_model_path)
+    if (lora_path / "tokenizer_config.json").exists() and (
+        lora_path / "tokenization_qwen.py"
+    ).exists():
+        return str(lora_path)
+    return base_model_path
+
+
+def patch_qwen_tokenizer_file(tokenizer_path: str) -> None:
+    file_candidates = [
+        Path(tokenizer_path) / "tokenization_qwen.py",
+        Path.home()
+        / ".cache/huggingface/modules/transformers_modules"
+        / Path(tokenizer_path).name
+        / "tokenization_qwen.py",
+    ]
+    old = """    def __init__(\n            self,\n            vocab_file,\n            errors=\"replace\",\n            audio_start_tag='<audio>',\n            audio_end_tag='</audio>',\n            **kwargs,\n    ):\n        super().__init__(**kwargs)\n        self.audio_start_tag = audio_start_tag\n"""
+    new = """    def __init__(\n            self,\n            vocab_file,\n            errors=\"replace\",\n            audio_start_tag='<audio>',\n            audio_end_tag='</audio>',\n            **kwargs,\n    ):\n        self.audio_start_tag = audio_start_tag\n"""
+    marker = """        self.im_end_id = self.special_tokens[IMEND]\n"""
+    insertion = """        super().__init__(**kwargs)\n        self.im_end_id = self.special_tokens[IMEND]\n"""
+
+    for file_path in file_candidates:
+        if not file_path.exists():
+            continue
+        text = file_path.read_text(encoding="utf-8")
+        if "self.AUDIO_ST" not in text or "super().__init__(**kwargs)" not in text:
+            continue
+        if old in text and insertion not in text:
+            text = text.replace(old, new, 1)
+            text = text.replace(marker, insertion, 1)
+            file_path.write_text(text, encoding="utf-8")
+
+
 def parse_response(response: str) -> tuple[str | None, list | None, str | None]:
     text = response.strip()
     if "," not in text:
@@ -152,8 +186,13 @@ def main() -> int:
     refs_by_id = index_refs_by_id(args.test_refs_jsonl)
     test_records = load_jsonl(args.test_inputs_jsonl)[: args.num_samples]
 
+    tokenizer_path = resolve_tokenizer_path(
+        args.base_model_path, args.lora_model_path
+    )
+    patch_qwen_tokenizer_file(tokenizer_path)
+    print(f"tokenizer_path={tokenizer_path}")
     tokenizer = AutoTokenizer.from_pretrained(
-        args.base_model_path,
+        tokenizer_path,
         trust_remote_code=True,
     )
     tokenizer.model_max_length = max(tokenizer.model_max_length, 16384)
