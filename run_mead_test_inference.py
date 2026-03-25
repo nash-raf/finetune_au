@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import ast
+import copy
 import json
 from pathlib import Path
 
@@ -79,6 +80,21 @@ def load_records(path: Path) -> list[dict]:
     return records
 
 
+def build_generation_config(model, max_new_tokens: int, do_sample: bool):
+    generation_config = copy.deepcopy(model.generation_config)
+    generation_config.max_new_tokens = max_new_tokens
+    generation_config.max_length = max(
+        getattr(generation_config, "max_length", 0) or 0,
+        max_new_tokens + 8192,
+    )
+    generation_config.do_sample = do_sample
+    if not do_sample:
+        generation_config.top_p = 1.0
+        generation_config.top_k = 50
+        generation_config.temperature = 1.0
+    return generation_config
+
+
 def parse_response(response: str) -> tuple[str | None, list | None, str | None]:
     text = response.strip()
     if "," not in text:
@@ -106,12 +122,16 @@ def main() -> int:
         args.base_model_path,
         trust_remote_code=True,
     )
+    tokenizer.model_max_length = max(tokenizer.model_max_length, 16384)
     model = AutoModelForCausalLM.from_pretrained(
         args.base_model_path,
         device_map=args.device_map,
         trust_remote_code=True,
     ).eval()
     model = PeftModel.from_pretrained(model, args.lora_model_path)
+    generation_config = build_generation_config(
+        model, max_new_tokens=args.max_new_tokens, do_sample=args.do_sample
+    )
 
     records = load_records(args.test_inputs_jsonl)
     if args.max_samples > 0:
@@ -137,8 +157,7 @@ def main() -> int:
                 tokenizer,
                 query=query,
                 history=None,
-                max_new_tokens=args.max_new_tokens,
-                do_sample=args.do_sample,
+                generation_config=generation_config,
             )
             emotion_label, au_sequence, error = parse_response(response)
 
@@ -161,7 +180,10 @@ def main() -> int:
             responses_handle.write(json.dumps(result, ensure_ascii=False) + "\n")
 
             status = "ok" if error is None else f"parse_error={error}"
-            print(f"[{idx}/{len(records)}] {sample_id} -> {status}")
+            print(
+                f"[{idx}/{len(records)}] {sample_id} -> {status} "
+                f"(chars={len(response)})"
+            )
 
     return 0
 

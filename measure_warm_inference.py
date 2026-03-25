@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import time
 from pathlib import Path
@@ -70,6 +71,20 @@ def load_record(path: Path, index: int) -> dict:
     return records[index]
 
 
+def build_generation_config(model, max_new_tokens: int):
+    generation_config = copy.deepcopy(model.generation_config)
+    generation_config.max_new_tokens = max_new_tokens
+    generation_config.max_length = max(
+        getattr(generation_config, "max_length", 0) or 0,
+        max_new_tokens + 8192,
+    )
+    generation_config.do_sample = False
+    generation_config.top_p = 1.0
+    generation_config.top_k = 50
+    generation_config.temperature = 1.0
+    return generation_config
+
+
 def main() -> int:
     args = parse_args()
 
@@ -78,12 +93,14 @@ def main() -> int:
         args.base_model_path,
         trust_remote_code=True,
     )
+    tokenizer.model_max_length = max(tokenizer.model_max_length, 16384)
     model = AutoModelForCausalLM.from_pretrained(
         args.base_model_path,
         device_map=args.device_map,
         trust_remote_code=True,
     ).eval()
     model = PeftModel.from_pretrained(model, args.lora_model_path)
+    generation_config = build_generation_config(model, args.max_new_tokens)
     load_elapsed = time.perf_counter() - load_started
 
     record = load_record(args.test_inputs_jsonl, args.sample_index)
@@ -104,11 +121,11 @@ def main() -> int:
             tokenizer,
             query=query,
             history=None,
-            max_new_tokens=args.max_new_tokens,
-            do_sample=False,
+            generation_config=generation_config,
         )
         elapsed = time.perf_counter() - started
         print(f"run_{run_idx}_seconds={elapsed:.3f}")
+        print(f"run_{run_idx}_response_chars={len(response)}")
         print(f"run_{run_idx}_response_prefix={response[:200]!r}")
 
     return 0
