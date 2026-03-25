@@ -56,6 +56,17 @@ def parse_args() -> argparse.Namespace:
         default="cuda",
         help="Device map to pass to transformers, for example 'cuda' or 'auto'.",
     )
+    parser.add_argument(
+        "--max-new-tokens",
+        type=int,
+        default=4096,
+        help="Maximum number of new tokens to generate per sample.",
+    )
+    parser.add_argument(
+        "--do-sample",
+        action="store_true",
+        help="Enable sampling during generation. Defaults to greedy decoding.",
+    )
     return parser.parse_args()
 
 
@@ -122,7 +133,13 @@ def main() -> int:
                 ]
             )
 
-            response, _ = model.chat(tokenizer, query=query, history=None)
+            response, _ = model.chat(
+                tokenizer,
+                query=query,
+                history=None,
+                max_new_tokens=args.max_new_tokens,
+                do_sample=args.do_sample,
+            )
             emotion_label, au_sequence, error = parse_response(response)
 
             pred_json_path = args.pred_dir / f"{sample_id}.json"
