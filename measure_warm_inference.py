@@ -57,6 +57,11 @@ def parse_args() -> argparse.Namespace:
         default="cuda",
         help="Device map to pass to transformers.",
     )
+    parser.add_argument(
+        "--print-full-response",
+        action="store_true",
+        help="Print the complete raw response for each timed run.",
+    )
     return parser.parse_args()
 
 
@@ -135,6 +140,10 @@ def main() -> int:
         print(f"run_{run_idx}_seconds={elapsed:.3f}")
         print(f"run_{run_idx}_response_chars={len(response)}")
         print(f"run_{run_idx}_response_prefix={response[:200]!r}")
+        if args.print_full_response:
+            print(f"run_{run_idx}_response_full_start")
+            print(response)
+            print(f"run_{run_idx}_response_full_end")
 
     return 0
 

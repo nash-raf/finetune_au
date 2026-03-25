@@ -69,6 +69,11 @@ def parse_args() -> argparse.Namespace:
         default=6144,
         help="Maximum number of new tokens to generate.",
     )
+    parser.add_argument(
+        "--print-full-response",
+        action="store_true",
+        help="Print the complete raw response for each validated sample.",
+    )
     return parser.parse_args()
 
 
@@ -214,6 +219,10 @@ def main() -> int:
             f"predicted={first_frame_preview(parsed_au or [])}"
         )
         print(f"  response_chars={len(response)}")
+        if args.print_full_response:
+            print("  raw_response_start")
+            print(response)
+            print("  raw_response_end")
         print()
 
     return 0

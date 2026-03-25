@@ -68,6 +68,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Enable sampling during generation. Defaults to greedy decoding.",
     )
+    parser.add_argument(
+        "--print-full-response",
+        action="store_true",
+        help="Print the complete raw response for each sample.",
+    )
     return parser.parse_args()
 
 
@@ -192,6 +197,10 @@ def main() -> int:
                 f"[{idx}/{len(records)}] {sample_id} -> {status} "
                 f"(chars={len(response)})"
             )
+            if args.print_full_response:
+                print("RAW_RESPONSE_START")
+                print(response)
+                print("RAW_RESPONSE_END")
 
     return 0
 
