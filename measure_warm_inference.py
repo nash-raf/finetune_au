@@ -5,7 +5,10 @@ from __future__ import annotations
 
 import argparse
 import copy
+import functools
 import json
+import shutil
+import sys
 import time
 from pathlib import Path
 
@@ -61,6 +64,11 @@ def parse_args() -> argparse.Namespace:
         "--print-full-response",
         action="store_true",
         help="Print the complete raw response for each timed run.",
+    )
+    parser.add_argument(
+        "--debug-breakdown",
+        action="store_true",
+        help="Print fine-grained timing for audio preprocessing, context building, generation, and forward passes.",
     )
     return parser.parse_args()
 
@@ -124,10 +132,137 @@ def patch_qwen_tokenizer_file(tokenizer_path: str) -> None:
             file_path.write_text(text, encoding="utf-8")
 
 
+def ensure_base_model_support_files(base_model_path: str) -> None:
+    base_path = Path(base_model_path)
+    repo_root = Path(__file__).resolve().parent
+    required = [
+        "qwen_generation_utils.py",
+        "configuration_qwen.py",
+        "audio.py",
+        "cpp_kernels.py",
+    ]
+    for name in required:
+        dst = base_path / name
+        src = repo_root / name
+        if not dst.exists() and src.exists():
+            shutil.copy(src, dst)
+
+
 def resolve_torch_dtype(device_map: str):
     if device_map == "cpu":
         return torch.float32
     return torch.float16
+
+
+def sync_if_needed() -> None:
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+
+
+def instrument_inference(model, tokenizer, enabled: bool):
+    if not enabled:
+        return None, lambda: None
+
+    timings = {
+        "process_audio_seconds": 0.0,
+        "make_context_seconds": 0.0,
+        "audio_encode_seconds": 0.0,
+        "generate_seconds": 0.0,
+        "forward_seconds": 0.0,
+    }
+    counts = {
+        "process_audio_calls": 0,
+        "make_context_calls": 0,
+        "audio_encode_calls": 0,
+        "generate_calls": 0,
+        "forward_calls": 0,
+    }
+
+    model_module = sys.modules[model.__class__.__module__]
+    orig_make_context = getattr(model_module, "make_context", None)
+    orig_process_audio = getattr(tokenizer, "process_audio", None)
+    orig_audio_encode = getattr(model.transformer.audio, "encode", None)
+    orig_generate = model.generate
+    orig_forward = model.forward
+
+    def timed_call(key_seconds, key_calls, fn, *args, **kwargs):
+        sync_if_needed()
+        started = time.perf_counter()
+        result = fn(*args, **kwargs)
+        sync_if_needed()
+        timings[key_seconds] += time.perf_counter() - started
+        counts[key_calls] += 1
+        return result
+
+    if orig_make_context is not None:
+        @functools.wraps(orig_make_context)
+        def wrapped_make_context(*args, **kwargs):
+            return timed_call(
+                "make_context_seconds",
+                "make_context_calls",
+                orig_make_context,
+                *args,
+                **kwargs,
+            )
+
+        setattr(model_module, "make_context", wrapped_make_context)
+
+    if orig_process_audio is not None:
+        @functools.wraps(orig_process_audio)
+        def wrapped_process_audio(*args, **kwargs):
+            return timed_call(
+                "process_audio_seconds",
+                "process_audio_calls",
+                orig_process_audio,
+                *args,
+                **kwargs,
+            )
+
+        tokenizer.process_audio = wrapped_process_audio
+
+    if orig_audio_encode is not None:
+        @functools.wraps(orig_audio_encode)
+        def wrapped_audio_encode(*args, **kwargs):
+            return timed_call(
+                "audio_encode_seconds",
+                "audio_encode_calls",
+                orig_audio_encode,
+                *args,
+                **kwargs,
+            )
+
+        model.transformer.audio.encode = wrapped_audio_encode
+
+    @functools.wraps(orig_generate)
+    def wrapped_generate(*args, **kwargs):
+        return timed_call(
+            "generate_seconds",
+            "generate_calls",
+            orig_generate,
+            *args,
+            **kwargs,
+        )
+
+    @functools.wraps(orig_forward)
+    def wrapped_forward(*args, **kwargs):
+        return timed_call(
+            "forward_seconds",
+            "forward_calls",
+            orig_forward,
+            *args,
+            **kwargs,
+        )
+
+    model.generate = wrapped_generate
+    model.forward = wrapped_forward
+
+    def reset_timings():
+        for key in timings:
+            timings[key] = 0.0
+        for key in counts:
+            counts[key] = 0
+
+    return (timings, counts), reset_timings
 
 
 def main() -> int:
@@ -137,6 +272,7 @@ def main() -> int:
     tokenizer_path = resolve_tokenizer_path(
         args.base_model_path, args.lora_model_path
     )
+    ensure_base_model_support_files(args.base_model_path)
     patch_qwen_tokenizer_file(tokenizer_path)
     print(f"tokenizer_path={tokenizer_path}")
     tokenizer = AutoTokenizer.from_pretrained(
@@ -154,6 +290,9 @@ def main() -> int:
     model.generation_config.max_length = 16384
     generation_config = build_generation_config(model, args.max_new_tokens)
     load_elapsed = time.perf_counter() - load_started
+    instrumentation, reset_timings = instrument_inference(
+        model, tokenizer, enabled=args.debug_breakdown
+    )
 
     record = load_record(args.test_inputs_jsonl, args.sample_index)
     user_message = record["messages"][0]
@@ -168,6 +307,7 @@ def main() -> int:
     print(f"model_load_seconds={load_elapsed:.3f}")
 
     for run_idx in range(1, args.warm_runs + 1):
+        reset_timings()
         started = time.perf_counter()
         response, _ = model.chat(
             tokenizer,
@@ -179,6 +319,41 @@ def main() -> int:
         print(f"run_{run_idx}_seconds={elapsed:.3f}")
         print(f"run_{run_idx}_response_chars={len(response)}")
         print(f"run_{run_idx}_response_prefix={response[:200]!r}")
+        if instrumentation is not None:
+            timings, counts = instrumentation
+            print(
+                f"run_{run_idx}_process_audio_seconds={timings['process_audio_seconds']:.3f}"
+            )
+            print(
+                f"run_{run_idx}_process_audio_calls={counts['process_audio_calls']}"
+            )
+            print(
+                f"run_{run_idx}_make_context_seconds={timings['make_context_seconds']:.3f}"
+            )
+            print(
+                f"run_{run_idx}_make_context_calls={counts['make_context_calls']}"
+            )
+            print(
+                f"run_{run_idx}_audio_encode_seconds={timings['audio_encode_seconds']:.3f}"
+            )
+            print(
+                f"run_{run_idx}_audio_encode_calls={counts['audio_encode_calls']}"
+            )
+            print(
+                f"run_{run_idx}_generate_seconds={timings['generate_seconds']:.3f}"
+            )
+            print(f"run_{run_idx}_generate_calls={counts['generate_calls']}")
+            print(
+                f"run_{run_idx}_forward_seconds={timings['forward_seconds']:.3f}"
+            )
+            print(f"run_{run_idx}_forward_calls={counts['forward_calls']}")
+            if counts["forward_calls"] > 0:
+                print(
+                    "run_{}_avg_forward_seconds={:.6f}".format(
+                        run_idx,
+                        timings["forward_seconds"] / counts["forward_calls"],
+                    )
+                )
         if args.print_full_response:
             print(f"run_{run_idx}_response_full_start")
             print(response)
