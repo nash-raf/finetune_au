@@ -22,6 +22,18 @@ from accelerate.utils import DistributedType
 
 
 IGNORE_TOKEN_ID = LabelSmoother.ignore_index
+CANONICAL_EMOTIONS = frozenset(
+    {
+        "angry",
+        "contempt",
+        "disgust",
+        "fear",
+        "happy",
+        "neutral",
+        "sad",
+        "surprised",
+    }
+)
 
 
 @dataclass
@@ -141,6 +153,106 @@ def from_list_format(list_format: List[Dict]):
         else:
             raise ValueError("Unsupport element: " + str(ele))
     return text
+
+
+def assistant_has_canonical_prefix(content: str) -> bool:
+    stripped = content.strip().lower()
+    return any(
+        stripped == emotion or stripped.startswith(f"{emotion},")
+        for emotion in CANONICAL_EMOTIONS
+    )
+
+
+def validate_source_messages(source: List[Dict]) -> None:
+    if not source:
+        raise ValueError("Encountered an empty conversation sample.")
+    if source[0].get("role") != "user":
+        raise ValueError("Each conversation must start with a user message.")
+
+    saw_assistant = False
+    for sentence in source:
+        role = sentence.get("role")
+        if role == "user":
+            audio_path = sentence.get("audio")
+            content = sentence.get("content", "")
+            if not audio_path:
+                raise KeyError("User message is missing the required 'audio' field.")
+            if not os.path.exists(audio_path):
+                raise FileNotFoundError(f"Audio file does not exist: {audio_path}")
+            if not isinstance(content, str) or not content.strip():
+                raise ValueError("User message content must be a non-empty string.")
+        elif role == "assistant":
+            saw_assistant = True
+            content = sentence.get("content", "")
+            if not isinstance(content, str) or not content.strip():
+                raise ValueError("Assistant message content must be a non-empty string.")
+            if not assistant_has_canonical_prefix(content):
+                raise ValueError(
+                    "Assistant content must start with a canonical emotion label, "
+                    "for example 'angry, ...'."
+                )
+        else:
+            raise NotImplementedError(f"Unsupported role: {role}")
+
+    if not saw_assistant:
+        raise ValueError("Each conversation must contain at least one assistant message.")
+
+
+def measure_sample_length(
+    source: List[Dict],
+    tokenizer: transformers.PreTrainedTokenizer,
+    system_message: str = "You are a helpful assistant.",
+) -> int:
+    im_start = tokenizer.im_start_id
+    im_end = tokenizer.im_end_id
+    nl_token = tokenizer('\n').input_ids
+
+    def _tokenize_len(role: str, content: str) -> int:
+        audio_info = tokenizer.process_audio(content)
+        encoded = tokenizer.encode(
+            role, allowed_special=set(tokenizer.AUDIO_ST), audio_info=audio_info
+        ) + nl_token + tokenizer.encode(
+            content, allowed_special=set(tokenizer.AUDIO_ST), audio_info=audio_info
+        )
+        return len(encoded)
+
+    total_len = 1 + _tokenize_len("system", system_message) + 1 + len(nl_token)
+    for sentence in source:
+        if sentence["role"] == "user":
+            query = from_list_format(
+                [{"audio": sentence["audio"]}, {"text": sentence["content"]}]
+            )
+            total_len += 1 + _tokenize_len("user", query) + 1 + len(nl_token)
+        elif sentence["role"] == "assistant":
+            total_len += 1 + _tokenize_len("assistant", sentence["content"]) + 1 + len(
+                nl_token
+            )
+    return total_len
+
+
+def report_truncation_risks(
+    raw_data: List[Dict[str, Any]],
+    tokenizer: transformers.PreTrainedTokenizer,
+    max_len: int,
+    split_name: str,
+) -> None:
+    over_limit = 0
+    longest = 0
+
+    for example in raw_data:
+        source = example["messages"]
+        validate_source_messages(source)
+        sample_len = measure_sample_length(source, tokenizer)
+        if sample_len > max_len:
+            over_limit += 1
+            longest = max(longest, sample_len)
+
+    if over_limit:
+        rank0_print(
+            f"Warning: {over_limit} {split_name} samples exceed model_max_length="
+            f"{max_len}. Longest sample length={longest}. These samples will be "
+            "truncated during training."
+        )
 
 
 def preprocess(
@@ -284,6 +396,8 @@ def make_supervised_data_module(
     with open(data_args.data_path, "r") as f:
         for line in f:
             train_data.append(json.loads(line))
+    rank0_print("Validating train data format and checking truncation risk...")
+    report_truncation_risks(train_data, tokenizer, max_len, "train")
     train_dataset = dataset_cls(train_data, tokenizer=tokenizer, max_len=max_len)
     
     if data_args.eval_data_path:
@@ -291,6 +405,8 @@ def make_supervised_data_module(
         with open(data_args.eval_data_path, "r") as f:
             for line in f:
                 eval_data.append(json.loads(line))
+        rank0_print("Validating eval data format and checking truncation risk...")
+        report_truncation_risks(eval_data, tokenizer, max_len, "eval")
         eval_dataset = dataset_cls(eval_data, tokenizer=tokenizer, max_len=max_len)
     else:
         eval_dataset = None

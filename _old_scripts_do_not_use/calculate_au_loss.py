@@ -1,3 +1,5 @@
+"""Archived legacy script. Do not use in the corrected local pipeline."""
+
 import os
 import json
 import numpy as np

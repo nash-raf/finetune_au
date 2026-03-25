@@ -9,7 +9,7 @@ DIR=`pwd`
 # After setting the options, please run the script on each worker.
 
 # Number of GPUs per GPU worker
-GPUS_PER_NODE=2
+GPUS_PER_NODE=1
 
 # Number of GPU workers, for single-worker training, please set to 1
 NNODES=${NNODES:-1}
@@ -24,9 +24,10 @@ MASTER_ADDR=${MASTER_ADDR:-localhost}
 MASTER_PORT=${MASTER_PORT:-6001}
 
 MODEL="./Qwen-Audio-Chat" # Set the path if you do not want to load from huggingface directly
-# ATTENTION: specify the path to your training data, which should be a json file consisting of a list of conversations.
+# ATTENTION: specify the path to your training data, which should be a JSONL file with one conversation object per line.
 # See the section for finetuning in README for more information.
-DATA="data/training_data_simple_au_instrucion2.jsonl"     
+DATA="/home/user/D/mead_train.jsonl"
+EVAL_DATA="/home/user/D/mead_val.jsonl"
 SAVE="save/qwen-audio-chat"       # save path
 DS_CONFIG_PATH="ds_config_zero2.json"
 USE_LORA=True
@@ -34,7 +35,7 @@ Q_LORA=False
 
 function usage() {
     echo '
-Usage: bash finetune.sh [-m MODEL_PATH] [-d DATA_PATH] [--deepspeed DS_CONFIG_PATH] [--use_lora USE_LORA] [--q_lora Q_LORA]
+Usage: bash finetune.sh [-m MODEL_PATH] [-d DATA_PATH] [-e EVAL_DATA_PATH] [--deepspeed DS_CONFIG_PATH] [--use_lora USE_LORA] [--q_lora Q_LORA]
 '
 }
 
@@ -47,6 +48,10 @@ while [[ "$1" != "" ]]; do
         -d | --data )
             shift
             DATA=$1
+            ;;
+        -e | --eval-data )
+            shift
+            EVAL_DATA=$1
             ;;
         --deepspeed )
             shift
@@ -81,6 +86,17 @@ DISTRIBUTED_ARGS="
     --master_port $MASTER_PORT
 "
 
+if [[ -f "$EVAL_DATA" ]]; then
+    EVAL_ARGS="
+        --eval_data_path $EVAL_DATA \
+        --evaluation_strategy steps \
+        --eval_steps 100 \
+    "
+else
+    echo "Eval data not found at $EVAL_DATA. Running without eval."
+    EVAL_ARGS='--evaluation_strategy no'
+fi
+
 torchrun $DISTRIBUTED_ARGS finetune.py \
     --model_name_or_path $MODEL \
     --data_path $DATA \
@@ -91,7 +107,6 @@ torchrun $DISTRIBUTED_ARGS finetune.py \
     --per_device_train_batch_size 1 \
     --per_device_eval_batch_size 1 \
     --gradient_accumulation_steps 1 \
-    --evaluation_strategy "no" \
     --save_strategy "steps" \
     --save_steps 100 \
     --save_total_limit 5 \
@@ -103,10 +118,11 @@ torchrun $DISTRIBUTED_ARGS finetune.py \
     --lr_scheduler_type "cosine" \
     --logging_steps 1 \
     --report_to "wandb" \
-    --model_max_length 3000 \
+    --model_max_length 6144 \
     --gradient_checkpointing True \
     --lazy_preprocess True \
     --use_lora ${USE_LORA} \
     --q_lora ${Q_LORA} \
-    --deepspeed ${DS_CONFIG_PATH}
+    --deepspeed ${DS_CONFIG_PATH} \
+    ${EVAL_ARGS}
     

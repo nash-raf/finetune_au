@@ -1,3 +1,5 @@
+"""Archived legacy script. Do not use in the corrected local pipeline."""
+
 import os
 import json
 
@@ -80,6 +82,12 @@ def process_au_file(input_file_path, output_file_path):
 def main():
     input_dir = 'data/MEAD_AU_Test_label'
     output_dir = 'data/MEAD_AU_Simple_Test_Label'
+
+    if "MEAD_Sparse_AUs" in os.path.abspath(input_dir):
+        raise RuntimeError(
+            "This legacy script must not be run on the new sparse AU directory. "
+            "Those files are already chunk-aligned and sparse."
+        )
     
     if not os.path.exists(output_dir):
         os.makedirs(output_dir)
