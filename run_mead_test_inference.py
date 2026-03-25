@@ -95,6 +95,12 @@ def build_generation_config(model, max_new_tokens: int, do_sample: bool):
     return generation_config
 
 
+def resolve_torch_dtype(device_map: str):
+    if device_map == "cpu":
+        return torch.float32
+    return torch.float16
+
+
 def parse_response(response: str) -> tuple[str | None, list | None, str | None]:
     text = response.strip()
     if "," not in text:
@@ -126,9 +132,11 @@ def main() -> int:
     model = AutoModelForCausalLM.from_pretrained(
         args.base_model_path,
         device_map=args.device_map,
+        torch_dtype=resolve_torch_dtype(args.device_map),
         trust_remote_code=True,
     ).eval()
     model = PeftModel.from_pretrained(model, args.lora_model_path)
+    model.generation_config.max_length = 16384
     generation_config = build_generation_config(
         model, max_new_tokens=args.max_new_tokens, do_sample=args.do_sample
     )

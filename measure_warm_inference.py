@@ -85,6 +85,12 @@ def build_generation_config(model, max_new_tokens: int):
     return generation_config
 
 
+def resolve_torch_dtype(device_map: str):
+    if device_map == "cpu":
+        return torch.float32
+    return torch.float16
+
+
 def main() -> int:
     args = parse_args()
 
@@ -97,9 +103,11 @@ def main() -> int:
     model = AutoModelForCausalLM.from_pretrained(
         args.base_model_path,
         device_map=args.device_map,
+        torch_dtype=resolve_torch_dtype(args.device_map),
         trust_remote_code=True,
     ).eval()
     model = PeftModel.from_pretrained(model, args.lora_model_path)
+    model.generation_config.max_length = 16384
     generation_config = build_generation_config(model, args.max_new_tokens)
     load_elapsed = time.perf_counter() - load_started
 
